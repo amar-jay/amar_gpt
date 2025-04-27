@@ -14,6 +14,7 @@ class FeedForward(nn.Module):
 	def forward(self, x):
 		#TODO: apply a better activation function
 		#TODO: apply MoE later
+		#TODO: apply dropout
 		return self.fc2(F.relu(self.fc1(x)))
 
 class AttentionType(Enum):
@@ -22,7 +23,11 @@ class AttentionType(Enum):
     LATENT = 3 #TODO: implement latent attention by deepseek
 
 class Attention(nn.Module):
-	def __init__(self, input_dim, hidden_dim, dropout_p=0.0, use_flash=False):
+	def __init__(self, input_dim, hidden_dim, dropout_p=0.0, 
+	      use_flash=False, 
+			use_kv_cache = False,
+			use_kv_norm=False):
+
 		super(Attention, self).__init__()
 		self.k = nn.Linear(input_dim, hidden_dim)
 		self.q = nn.Linear(input_dim, hidden_dim)
@@ -36,6 +41,7 @@ class Attention(nn.Module):
 
 
 	def forward(self, x, attention_mask=None):
+		B, T, C = x.shape
 
 		_k = self.k(x)
 		_q = self.q(x)
@@ -48,20 +54,28 @@ class Attention(nn.Module):
 			if channel_size % self.num_heads != 0:
 				raise ValueError("We have a fractional head_dim . the num_channels isn't perfectly divisible by head size")
 
-			_k = _k.resize(batch_size, seq_len, self.num_heads, channel_size)
-			_q = _q.resize(batch_size, seq_len, self.num_heads, channel_size)
-			_v = _v.resize(batch_size, seq_len, self.num_heads, channel_size)
+			_k = _k.view(batch_size, seq_len, self.num_heads, channel_size // self.num_heads).transpose(1, 2)
+			_q = _q.view(batch_size, seq_len, self.num_heads, channel_size // self.num_heads).transpose(1, 2)
+			_v = _v.view(batch_size, seq_len, self.num_heads, channel_size // self.num_heads).transpose(1, 2)
+
+			# kv norm
+			kv = _k + _v
+			_k /= kv
+			_v /= kv
 
 			att = F.softmax((_q @ _k.T) / _k.size(3))
 			unmasked = att @ _v
 			if attention_mask is None:
 				attention_mask = torch.tril(torch.ones_like(unmasked))
 			masked = unmasked * attention_mask
+		masked = masked.transpose(1, 2).contiguous().view(B, T, C)
+		#TODO: apply dropout here
 		return masked
 
 
 class PositionalEmbedding(nn.Module):
 	def __init__(self, num_embeddings, vocab_size, emb_type="absolute", use_bias = False) -> None:
+		super().__init__()
 		self.emb_type = emb_type
 		self.weight = nn.Parameter(torch.ones(vocab_size, num_embeddings))
 		if use_bias:
@@ -88,48 +102,59 @@ class Embedding(nn.Module):
 
 class MultiheadAttention(nn.Module):
 	def __init__(self, input_dim, channel_size, num_heads=4, 
-	      use_self_attention=True, use_dropout=True, use_kv_norm=True):
+	      use_flash=True, dropout_p=0.0, use_kv_norm=True,
+			num_att_blocks = 4
+			):
+		super().__init__()
 		"""
 		channel_size is the embed dimension of the KQV affine layers before atttended
 		input_dim is basically the vocab_size, since it recievees input from the embedding layer directly
 		"""
-		head_dim =  channel_size // num_heads
 		self.num_heads = num_heads
-		self.k = nn.Linear(input_dim, channel_size) 
-		self.q = nn.Linear(input_dim, channel_size)
-		self.v = nn.Linear(input_dim, channel_size)
+		block = nn.Sequential(
+			nn.LayerNorm(channel_size),
+			Attention(input_dim, input_dim*4, dropout_p, 
+		   use_flash=use_flash, use_kv_norm=use_kv_norm),
+			nn.LayerNorm(channel_size),
+			FeedForward(input_dim, input_dim, channel_size),
+		)
+		self.block_layers = nn.ModuleList([block for _ in range(num_att_blocks)])
 
 	def forward(self, x):
-		_k = self.k(x)
-		_q = self.q(x)
-		_v = self.v(x)
-
-		batch_size, seq_len, channel_size = _k.shape
-		if channel_size % self.num_heads != 0:
-			raise ValueError("We have a fractional head_dim . the num_channels isn't perfectly divisible by head size")
-		_k = _k.view(batch_size, seq_len, self.num_heads, channel_size // self.num_heads).transpose(1, 2)
-		_q = _q.view(batch_size, seq_len, self.num_heads, channel_size // self.num_heads).transpose(1, 2)
-		_v = _v.view(batch_size, seq_len, self.num_heads, channel_size // self.num_heads).transpose(1, 2)
-
-		# att = (_k @ _q.T) / (_k.size(2) ** 0.5)
-		# result = F.softmax(att) @ _v
+		for _ in self.block_layers:
+			x = self.block(x)
+		return x
 
 
 class Transformer(nn.Module):
 	def __init__(self, vocab_size, dropout=0.3):
 		super().__init__()
 		self.emb = Embedding(8, vocab_size=vocab_size)
-		self.att = MultiheadAttention(input_dim=vocab_size, channel_size=4*vocab_size, num_heads=4)
 		self.dropout = nn.Dropout(dropout)
-		self.norm = nn.LayerNorm(vocab_size)
-		self.ff = FeedForward(vocab_size, vocab_size, 4*vocab_size, )
+		self.att = MultiheadAttention(input_dim=vocab_size, channel_size=4*vocab_size, num_heads=4, num_att_blocks=1)
+		self.norm = nn.LayerNorm(4*vocab_size)
+		self.lm_head = nn.Linear(4*vocab_size, vocab_size, bias=False)
 
-	def forward(self, x):
+	def forward(self, x, targets=None):
 		_emb = self.emb(x) # B, T, vocab_size
-		_att = self.att(_emb)
-		_att = self.dropout(_att + _emb)
-		_att = self.norm(_att)
-		_ff = self.ff(_att)
+		x = self.att(_emb)
+		x = self.dropout(x + _emb)
+		x = self.norm(x)
 
-		return _ff
+		if targets is not None:
+			logits = self.lm_head(x)
+			loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+			return logits, loss
 
+		# inference-time mini-optimization: only forward the lm_head on the very last position
+		logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+		return logits, None
+
+
+if __name__ == "__main__":
+	# test the model
+	model = Transformer(vocab_size=1000)
+	x = torch.randint(0, 1000, (2, 10))
+	logits, loss = model(x)
+	print(logits.shape) # should be (2, 1, 1000)
+	print(loss) # should be None
